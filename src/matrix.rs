@@ -413,6 +413,13 @@ impl Notifier {
         })
     }
 
+    /// Invalidate the token and delete the device on the server. The store
+    /// is left on disk but is useless afterwards.
+    pub async fn logout(self) -> anyhow::Result<()> {
+        self.client.matrix_auth().logout().await.context("logout")?;
+        Ok(())
+    }
+
     /// Persist anything the SDK may have rotated (tokens) and release the
     /// store. Returns the identity fingerprint after the run.
     pub async fn close(self) -> anyhow::Result<String> {
