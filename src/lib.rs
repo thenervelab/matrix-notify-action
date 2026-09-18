@@ -19,5 +19,7 @@
 //! (archive format, message formatting, room-target parsing, GitHub secret
 //! sealing) is unit-testable offline; only [`matrix`] talks to the network.
 
+pub mod message;
 pub mod state;
 pub mod store;
+pub mod target;
