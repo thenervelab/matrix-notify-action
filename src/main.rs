@@ -59,6 +59,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Create or update a GitHub Actions repository secret (needs a token with secrets: write)
+    GithubSecret(GithubSecretArgs),
+}
+
+#[derive(Args)]
+struct GithubSecretArgs {
+    /// Secret name
+    #[arg(long, default_value = "MATRIX_STATE")]
+    name: String,
+    /// owner/repo (default: $GITHUB_REPOSITORY)
+    #[arg(long, env = "GITHUB_REPOSITORY")]
+    repo: String,
+    /// GitHub API base URL
+    #[arg(long, env = "GITHUB_API_URL", default_value = "https://api.github.com")]
+    api_url: String,
+    /// Name of the environment variable holding the token (never passed on the command line)
+    #[arg(long, default_value = "GH_TOKEN")]
+    token_env: String,
+    /// File with the secret value, or `-` for stdin
+    #[arg(long = "value-file", default_value = "-")]
+    value_file: String,
 }
 
 #[derive(Args)]
@@ -185,6 +206,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Send(a) => cmd_send(&dir, a).await,
         Cmd::State { cmd } => cmd_state(&dir, cmd),
         Cmd::Whoami { json } => cmd_whoami(&dir, json).await,
+        Cmd::GithubSecret(a) => cmd_github_secret(a).await,
     }
 }
 
@@ -444,5 +466,29 @@ async fn cmd_whoami(dir: &std::path::Path, json: bool) -> anyhow::Result<()> {
     if !w.server_ok {
         bail!("homeserver rejected the session token");
     }
+    Ok(())
+}
+
+async fn cmd_github_secret(a: GithubSecretArgs) -> anyhow::Result<()> {
+    let token = std::env::var(&a.token_env)
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| anyhow!("environment variable {} is not set", a.token_env))?;
+    let value = if a.value_file == "-" {
+        read_stdin_trimmed()?
+    } else {
+        Zeroizing::new(
+            std::fs::read_to_string(&a.value_file)
+                .with_context(|| format!("reading {}", a.value_file))?
+                .trim_end_matches(['\n', '\r'])
+                .to_owned(),
+        )
+    };
+    if value.is_empty() {
+        bail!("refusing to store an empty secret");
+    }
+    let client = matrix_notify::github::SecretsClient::new(&a.api_url, &a.repo, token.trim())?;
+    client.put_secret(&a.name, &value).await?;
+    eprintln!("secret {} updated on {}", a.name, a.repo);
     Ok(())
 }

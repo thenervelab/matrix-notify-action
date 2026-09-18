@@ -192,6 +192,60 @@ fn send_argument_validation() {
     bin().args(["--store", store, "send", "--room", "#ci:example.org"]).assert().failure();
 }
 
+#[tokio::test]
+async fn github_secret_via_cli() {
+    use base64::Engine;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sk = crypto_box::SecretKey::generate(&mut crypto_box::aead::OsRng);
+    let pk = base64::engine::general_purpose::STANDARD.encode(sk.public_key().as_bytes());
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/actions/secrets/public-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "key_id": "k1", "key": pk })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/acme/widgets/actions/secrets/MATRIX_STATE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    tokio::task::spawn_blocking(move || {
+        bin()
+            .env("GH_TOKEN", "ghp_test")
+            .args(["github-secret", "--repo", "acme/widgets", "--api-url", &uri])
+            .write_stdin("bmV3\n")
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("secret MATRIX_STATE updated"));
+
+        // Without a token: fail before any request.
+        bin()
+            .env_remove("GH_TOKEN")
+            .args(["github-secret", "--repo", "acme/widgets", "--api-url", "http://127.0.0.1:1"])
+            .write_stdin("x")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("GH_TOKEN is not set"));
+    })
+    .await
+    .unwrap();
+
+    let put =
+        server.received_requests().await.unwrap().into_iter().find(|r| r.method.as_str() == "PUT").unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
+    let sealed =
+        base64::engine::general_purpose::STANDARD.decode(body["encrypted_value"].as_str().unwrap()).unwrap();
+    assert_eq!(sk.unseal(&sealed).unwrap(), b"bmV3");
+}
+
 #[test]
 fn login_requires_a_credential_source() {
     let dir = tempfile::tempdir().unwrap();
