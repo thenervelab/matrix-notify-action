@@ -255,6 +255,7 @@ fn print_cross_signing(report: &CrossSigningReport) {
             "cross-signing: WARNING not bootstrapped: {why}\n  Finish it with `matrix-notify cross-sign \
              --password-stdin` on this store and re-export."
         ),
+        CrossSigningReport::Incomplete(why) => eprintln!("cross-signing: WARNING {why}"),
     }
 }
 
@@ -545,5 +546,6 @@ async fn cmd_cross_sign(dir: &std::path::Path, password_stdin: bool, reset: bool
             bail!("device is not signed; use --reset to take over")
         }
         CrossSigningReport::NeedsInteractiveAuth(why) => bail!("not bootstrapped: {why}"),
+        CrossSigningReport::Incomplete(why) => bail!("{why}"),
     }
 }

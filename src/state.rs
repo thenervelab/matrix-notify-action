@@ -85,6 +85,8 @@ pub enum StateError {
     MissingFile(String),
     #[error("archive is missing {0}; refusing to restore a partial identity")]
     Incomplete(String),
+    #[error("archive contains unexpected entry {0}")]
+    UnexpectedEntry(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -210,19 +212,23 @@ pub fn pack(dir: &Path, files: &[&str]) -> Result<Vec<u8>, StateError> {
     Ok(gz.finish()?)
 }
 
-/// Inverse of [`pack`]: write the archive's regular files into `dir`
-/// (created with mode 0700 if missing). The whole archive is extracted into
-/// a staging directory first and only replaces the existing files once every
-/// entry has been validated, so a bad archive or a failed write never leaves
-/// a mix of old and new files. Rejects anything that is not a plain relative
-/// file name so a hostile archive cannot write outside `dir`.
-pub fn unpack(dir: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
+/// Inverse of [`pack`]: restore exactly the files named in `expected` into
+/// `dir` (created with mode 0700 if missing). The whole archive is extracted
+/// into a staging directory and checked (every entry is a plain file name
+/// from `expected`, and every expected file is present) before anything in
+/// `dir` is replaced, so a bad archive or a failed write never leaves a mix
+/// of old and new files. SQLite `-wal`/`-shm` sidecars of a replaced
+/// database are removed so the new file is not paired with an old journal.
+pub fn unpack(dir: &Path, tgz: &[u8], expected: &[&str]) -> Result<Vec<String>, StateError> {
     crate::store::ensure_private_dir(dir)?;
     let staging = dir.join(format!(".import-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
     crate::store::ensure_private_dir(&staging)?;
-    let result = unpack_into(&staging, tgz).and_then(|names| {
+    let result = unpack_into(&staging, tgz, expected).and_then(|names| {
         for name in &names {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let _ = std::fs::remove_file(dir.join(format!("{name}{suffix}")));
+            }
             std::fs::rename(staging.join(name), dir.join(name))?;
         }
         Ok(names)
@@ -231,7 +237,7 @@ pub fn unpack(dir: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
     result
 }
 
-fn unpack_into(staging: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
+fn unpack_into(staging: &Path, tgz: &[u8], expected: &[&str]) -> Result<Vec<String>, StateError> {
     let gz = GzDecoder::new(tgz);
     let mut archive = tar::Archive::new(gz.take(MAX_PLAINTEXT));
     let mut written = Vec::new();
@@ -247,8 +253,11 @@ fn unpack_into(staging: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
             _ => return Err(StateError::UnsafePath(path)),
         };
         let name = name.to_string_lossy().into_owned();
-        if name.starts_with('.') || written.contains(&name) {
-            return Err(StateError::UnsafePath(path));
+        if !expected.contains(&name.as_str()) {
+            return Err(StateError::UnexpectedEntry(name));
+        }
+        if written.contains(&name) {
+            return Err(StateError::UnexpectedEntry(name));
         }
         let mut f = crate::store::create_private_file(&staging.join(&name))?;
         std::io::copy(&mut entry, &mut f)?;
@@ -257,6 +266,9 @@ fn unpack_into(staging: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
     }
     if archive.into_inner().limit() == 0 {
         return Err(StateError::TooLarge);
+    }
+    if let Some(missing) = expected.iter().find(|e| !written.iter().any(|w| w == *e)) {
+        return Err(StateError::Incomplete((*missing).to_owned()));
     }
     Ok(written)
 }
@@ -278,13 +290,7 @@ pub fn import(dir: &Path, key: &StateKey, input: &[u8]) -> Result<Vec<String>, S
         base64::engine::general_purpose::STANDARD.decode(compact)?
     };
     let tgz = open(key, &blob)?;
-    let names = unpack(dir, &tgz)?;
-    for required in crate::store::EXPORTED_FILES {
-        if !names.iter().any(|n| n == required) {
-            return Err(StateError::Incomplete((*required).to_owned()));
-        }
-    }
-    Ok(names)
+    unpack(dir, &tgz, crate::store::EXPORTED_FILES)
 }
 
 /// Convenience for the CLI: write `s` to `out` (a path or `-` for stdout)
@@ -407,7 +413,7 @@ mod tests {
         tar.append_data(&mut h, "nested/escape", &data[..]).unwrap();
         let tgz = tar.into_inner().unwrap().finish().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        assert!(matches!(unpack(dst.path(), &tgz).unwrap_err(), StateError::UnsafePath(_)));
+        assert!(matches!(unpack(dst.path(), &tgz, &["escape"]).unwrap_err(), StateError::UnsafePath(_)));
 
         let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
         let mut h = tar::Header::new_gnu();
@@ -416,7 +422,7 @@ mod tests {
         h.set_cksum();
         tar.append_link(&mut h, "link", "/etc/passwd").unwrap();
         let tgz = tar.into_inner().unwrap().finish().unwrap();
-        assert!(matches!(unpack(dst.path(), &tgz).unwrap_err(), StateError::NotAFile(_)));
+        assert!(matches!(unpack(dst.path(), &tgz, &["link"]).unwrap_err(), StateError::NotAFile(_)));
     }
 
     #[test]
@@ -434,7 +440,10 @@ mod tests {
 
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(dst.path().join("session.json"), b"old").unwrap();
-        assert!(matches!(unpack(dst.path(), &tgz).unwrap_err(), StateError::UnsafePath(_)));
+        assert!(matches!(
+            unpack(dst.path(), &tgz, &["session.json", "escape"]).unwrap_err(),
+            StateError::UnsafePath(_)
+        ));
         assert_eq!(std::fs::read(dst.path().join("session.json")).unwrap(), b"old");
         let leftovers: Vec<_> =
             std::fs::read_dir(dst.path()).unwrap().map(|e| e.unwrap().file_name()).collect();

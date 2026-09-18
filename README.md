@@ -24,14 +24,14 @@ can join). Once, on your machine:
 # 1. get the CLI (or: cargo install --git https://github.com/thenervelab/matrix-notify-action)
 curl -fsSL https://github.com/thenervelab/matrix-notify-action/releases/latest/download/matrix-notify-x86_64-unknown-linux-musl.tar.gz | tar xz
 
-# 2. log the bot in, join the room, print the two secrets
+# 2. log the bot in, join the room; the two secrets go to a private file
+#    (stdout is exactly two lines: MATRIX_STATE_KEY=... and MATRIX_STATE=...)
+umask 077
 GITHUB_REPOSITORY=your-org/your-repo \
-./matrix-notify --store ./bot-state login --homeserver hippius.com --user ci --password-stdin --join '#ci:hippius.com'
-# MATRIX_STATE_KEY=3f9a...   (64 hex chars)
-# MATRIX_STATE=TU5TMQ...     (~16 KB of base64)
+./matrix-notify --store ./bot-state login --homeserver hippius.com --user ci --password-stdin \
+  --join '#ci:hippius.com' > secrets.env
 
-# 3. store both as repository secrets, then forget the local copy
-./matrix-notify --store ./bot-state login ... > secrets.env      # or paste the two lines by hand
+# 3. store both as repository secrets (values via stdin, never argv), then forget the local copy
 grep '^MATRIX_STATE_KEY=' secrets.env | cut -d= -f2- | gh secret set MATRIX_STATE_KEY
 grep '^MATRIX_STATE='     secrets.env | cut -d= -f2- | gh secret set MATRIX_STATE
 rm -rf ./bot-state secrets.env
@@ -100,7 +100,7 @@ unnoticed, not because rotation is expected.
 | `notice` | `true` | `m.notice` (does not ring phones); `false` sends `m.text` |
 | `allow-unencrypted` | `false` | plaintext rooms are refused unless set |
 | `strict-recipients` | `false` | fail when any member has no device; default fails only when nobody could decrypt |
-| `timeout` | `60` | seconds, for the whole send (sync, members, key queries, send) |
+| `timeout` | `60` | seconds, for the whole send (sync, members, key queries, send); synchronous SQLite work may overrun it by a few seconds |
 | `version` | the action ref | release tag to download (`v1` resolves to the newest `v1.x.y`), or `source` to `cargo build` |
 | `gh-token` | | token with `secrets: write` to update `secret-name` if the identity ever changes |
 | `secret-name` | `MATRIX_STATE` | |
@@ -138,9 +138,12 @@ from the environment; it is never accepted on the command line by the action.
   the server. A room where nobody has a device (federation failure, empty
   room) is an error rather than a message no one can decrypt; members with no
   device are listed in a warning, or fail the run with `--strict-recipients`.
-- The bot device signs itself with cross-signing at `login`. If the account
-  already has a cross-signing identity from another session it is reported,
-  not replaced, unless `--reset-cross-signing`.
+- The bot device signs itself with cross-signing at `login`. Whether the
+  account already has an identity is read from the server's `/keys/query`
+  answer, not from the local cache, and the result is checked the same way
+  after upload (master key published, this device signed by it). An identity
+  created by another session is reported, not replaced, unless
+  `--reset-cross-signing`.
 - No refresh tokens are requested, so the token in the snapshot keeps working
   across runs without the state having to be written back. Homeservers that
   only issue short-lived tokens are not supported by this design.

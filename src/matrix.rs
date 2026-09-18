@@ -90,6 +90,8 @@ pub enum CrossSigningReport {
     NotSignedByExistingIdentity,
     /// Server required interactive auth we could not satisfy.
     NeedsInteractiveAuth(String),
+    /// Upload went through but the server does not show the expected result.
+    Incomplete(String),
 }
 
 pub struct SendOptions {
@@ -127,20 +129,32 @@ struct Coverage {
 /// treats "no devices" as "nothing to share with" and reports success; a
 /// notification nobody can decrypt is a failure for us.
 async fn recipient_coverage(client: &Client, room: &Room) -> anyhow::Result<Coverage> {
+    use matrix_sdk::ruma::events::room::history_visibility::HistoryVisibility;
     let own = client.user_id().ok_or_else(|| anyhow!("client has no user id"))?;
-    let members = room.members(RoomMemberships::ACTIVE).await.context("listing room members")?;
+    // The SDK shares with invited members only when history visibility
+    // allows them to read (matrix-sdk-base client.rs, share_room_key);
+    // count the same set.
+    let memberships = match room.history_visibility_or_default() {
+        HistoryVisibility::Joined => RoomMemberships::JOIN,
+        _ => RoomMemberships::ACTIVE,
+    };
+    let members = room.members(memberships).await.context("listing room members")?;
     let enc = client.encryption();
     let mut cov = Coverage { members: 0, devices: 0, without_devices: Vec::new() };
     for m in members.iter().filter(|m| m.user_id() != own) {
         cov.members += 1;
-        // One /keys/query per member; marks the user as tracked so the
-        // SDK's own pre-send query has nothing left to fetch.
+        // One /keys/query per member. The SDK runs its own query for
+        // untracked members again inside room.send; that is a second
+        // round-trip, not a different answer.
         enc.request_user_identity(m.user_id())
             .await
             .with_context(|| format!("querying keys of {}", m.user_id()))?;
         let devices =
             enc.get_user_devices(m.user_id()).await.with_context(|| format!("devices of {}", m.user_id()))?;
-        let n = devices.devices().filter(|d| !d.is_deleted() && !d.is_blacklisted()).count();
+        let n = devices
+            .devices()
+            .filter(|d| !d.is_deleted() && !d.is_blacklisted() && !d.is_dehydrated())
+            .count();
         if n == 0 {
             cov.without_devices.push(m.user_id().to_string());
         }
@@ -310,6 +324,106 @@ pub async fn login(dir: &Path, opts: LoginOptions) -> anyhow::Result<LoginReport
     })
 }
 
+/// What the server currently publishes for our own account.
+struct ServerKeys {
+    /// Base64 of the master key, if the account has a cross-signing identity.
+    master_key: Option<String>,
+    /// Whether this device's keys carry a signature by the self-signing key.
+    device_signed: bool,
+}
+
+/// `POST /keys/query` for our own user, read straight from the response. The
+/// SDK's identity cache is not authoritative here: it persists a freshly
+/// generated identity before uploading it, and it silently drops an identity
+/// it could not validate, so "nothing in the cache" can mean either.
+async fn server_cross_signing(
+    client: &Client,
+    user_id: &UserId,
+    device_id: &str,
+) -> anyhow::Result<ServerKeys> {
+    use matrix_sdk::ruma::api::client::keys::get_keys::v3::Request;
+    let mut req = Request::new();
+    req.device_keys.insert(user_id.to_owned(), Vec::new());
+    let resp = client.send(req).await.context("/keys/query for the bot's own account")?;
+    if let Some(f) = resp.failures.get(user_id.server_name().as_str()) {
+        bail!("homeserver could not answer /keys/query for {user_id}: {f}");
+    }
+    let first_key = |raw: Option<&matrix_sdk::ruma::serde::Raw<_>>| -> anyhow::Result<Option<String>> {
+        let Some(raw) = raw else { return Ok(None) };
+        let v: serde_json::Value = raw.deserialize_as().context("parsing cross-signing key")?;
+        Ok(v["keys"].as_object().and_then(|m| m.values().next()).and_then(|k| k.as_str()).map(str::to_owned))
+    };
+    let master_key = first_key(resp.master_keys.get(user_id))?;
+    let self_signing = first_key(resp.self_signing_keys.get(user_id))?;
+    let device_signed = match (self_signing, resp.device_keys.get(user_id).and_then(|d| d.get(device_id))) {
+        (Some(ssk), Some(raw)) => {
+            let v: serde_json::Value = raw.deserialize_as().context("parsing device keys")?;
+            v["signatures"][user_id.as_str()].get(format!("ed25519:{ssk}")).is_some()
+        }
+        _ => false,
+    };
+    Ok(ServerKeys { master_key, device_signed })
+}
+
+fn password_auth(user: &str, pw: &str, session: Option<String>) -> AuthData {
+    let mut auth =
+        Password::new(UserIdentifier::Matrix(MatrixUserIdentifier::new(user.to_owned())), pw.to_owned());
+    auth.session = session;
+    AuthData::Password(auth)
+}
+
+/// Upload (or replace, with `reset`) the cross-signing identity and sign
+/// this device, answering password UIA when the server asks. Returns
+/// `Ok(Some(why))` when we could not satisfy the server.
+async fn upload_identity(
+    client: &Client,
+    reset: bool,
+    password: Option<&(String, String)>,
+) -> anyhow::Result<Option<String>> {
+    let enc = client.encryption();
+    if reset {
+        let Some(handle) = enc.reset_cross_signing().await.context("resetting cross-signing")? else {
+            return Ok(None);
+        };
+        let Some((user, pw)) = password else {
+            return Ok(Some(
+                "server requires interactive auth to replace cross-signing keys; a password is needed".into(),
+            ));
+        };
+        let session = match handle.auth_type() {
+            matrix_sdk::encryption::CrossSigningResetAuthType::Uiaa(info) => info.session.clone(),
+            matrix_sdk::encryption::CrossSigningResetAuthType::OAuth(_) => {
+                return Ok(Some(
+                    "server requires approval through its OAuth provider; do that from a browser session"
+                        .into(),
+                ))
+            }
+        };
+        return match handle.auth(Some(password_auth(user, pw, session))).await {
+            Ok(()) => Ok(None),
+            Err(e) => Ok(Some(e.to_string())),
+        };
+    }
+    match enc.bootstrap_cross_signing(None).await {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            let Some(uiaa) = e.as_uiaa_response().cloned() else {
+                return Err(anyhow!(e).context("uploading cross-signing keys"));
+            };
+            let Some((user, pw)) = password else {
+                return Ok(Some(
+                    "server requires interactive auth to upload cross-signing keys; a password is needed"
+                        .into(),
+                ));
+            };
+            match enc.bootstrap_cross_signing(Some(password_auth(user, pw, uiaa.session))).await {
+                Ok(()) => Ok(None),
+                Err(e) => Ok(Some(e.to_string())),
+            }
+        }
+    }
+}
+
 async fn setup_cross_signing(
     client: &Client,
     user_id: &UserId,
@@ -317,42 +431,57 @@ async fn setup_cross_signing(
     password: Option<(String, String)>,
 ) -> anyhow::Result<CrossSigningReport> {
     let enc = client.encryption();
-    // Ask the server, not the local cache: an empty cache after a failed key
-    // query must not be read as "no identity exists" or we would replace
-    // the account's cross-signing keys without --reset-cross-signing.
-    let existing = enc
-        .request_user_identity(user_id)
-        .await
-        .context("querying own cross-signing identity on the server (not bootstrapping blind)")?;
+    let device_id = client.device_id().ok_or_else(|| anyhow!("no device id"))?.to_string();
+
+    // Fail closed: no server answer, no decision.
+    let server = server_cross_signing(client, user_id, &device_id).await?;
     let status = enc.cross_signing_status().await;
     let have_private = status.as_ref().is_some_and(|s| s.has_master && s.has_self_signing);
+    let local_master = enc
+        .get_user_identity(user_id)
+        .await
+        .context("reading local identity")?
+        .and_then(|i| i.master_key().get_first_key().map(|k| k.to_base64()));
 
-    if existing.is_some() && have_private && !reset {
-        return Ok(CrossSigningReport::Present);
-    }
-    if existing.is_some() && !reset {
-        warn!("cross-signing is already set up for {user_id} by another session; this device is not signed by it. \
-               Verify it from that session, or re-run login with --reset-cross-signing.");
-        return Ok(CrossSigningReport::NotSignedByExistingIdentity);
+    if let (Some(srv), false) = (&server.master_key, reset) {
+        // The account already has a published identity. It is ours only if
+        // we hold private keys for exactly that master key.
+        if !(have_private && local_master.as_deref() == Some(srv.as_str())) {
+            return Ok(CrossSigningReport::NotSignedByExistingIdentity);
+        }
+        if server.device_signed {
+            return Ok(CrossSigningReport::Present);
+        }
+        // Ours, but the device signature never reached the server (e.g. a
+        // login that stopped at UIA): re-upload and sign.
     }
 
-    match enc.bootstrap_cross_signing(None).await {
-        Ok(()) => Ok(CrossSigningReport::Bootstrapped),
-        Err(e) => {
-            let Some(uiaa) = e.as_uiaa_response().cloned() else {
-                return Err(anyhow!(e).context("bootstrapping cross-signing"));
-            };
-            let Some((user, pw)) = password else {
-                return Ok(CrossSigningReport::NeedsInteractiveAuth(
-                    "server requires interactive auth to upload cross-signing keys; log in with a password (not --token)".into(),
-                ));
-            };
-            let mut auth = Password::new(UserIdentifier::Matrix(MatrixUserIdentifier::new(user)), pw);
-            auth.session = uiaa.session;
-            match enc.bootstrap_cross_signing(Some(AuthData::Password(auth))).await {
-                Ok(()) => Ok(CrossSigningReport::Bootstrapped),
-                Err(e) => Ok(CrossSigningReport::NeedsInteractiveAuth(e.to_string())),
-            }
+    if let Some(why) =
+        upload_identity(client, reset && server.master_key.is_some(), password.as_ref()).await?
+    {
+        return Ok(CrossSigningReport::NeedsInteractiveAuth(why));
+    }
+
+    // Postcondition on the server, not on what we sent: the identity we
+    // hold is the one published, and this device carries its signature.
+    let after = server_cross_signing(client, user_id, &device_id).await?;
+    let local_master = enc
+        .get_user_identity(user_id)
+        .await
+        .context("reading local identity")?
+        .and_then(|i| i.master_key().get_first_key().map(|k| k.to_base64()));
+    match (&after.master_key, after.device_signed) {
+        (Some(srv), true) if local_master.as_deref() == Some(srv.as_str()) => {
+            Ok(CrossSigningReport::Bootstrapped)
+        }
+        (Some(srv), true) => Ok(CrossSigningReport::Incomplete(format!(
+            "server publishes master key {srv} but this store holds different private keys"
+        ))),
+        (Some(_), false) => Ok(CrossSigningReport::Incomplete(
+            "keys uploaded but the server shows no signature on this device".into(),
+        )),
+        (None, _) => {
+            Ok(CrossSigningReport::Incomplete("server shows no cross-signing identity after upload".into()))
         }
     }
 }
@@ -370,7 +499,10 @@ impl Notifier {
     pub async fn open(dir: &Path, keep_sessions: bool, timeout: Duration) -> anyhow::Result<Self> {
         let session = Session::load(dir)?;
         if !keep_sessions {
-            let n = crate::store::hygiene(dir)?;
+            // Blocking SQLite work (10 s busy timeout): keep it off the
+            // async thread so the caller's deadline can still fire.
+            let d = dir.to_path_buf();
+            let n = tokio::task::spawn_blocking(move || crate::store::hygiene(&d)).await??;
             debug!(removed = n, "crypto store hygiene");
         }
         let client = build_client(&session.homeserver, dir, false, timeout).await?;
@@ -424,7 +556,10 @@ impl Notifier {
         let mut cov = Coverage { members: 0, devices: 0, without_devices: Vec::new() };
         if encrypted {
             cov = recipient_coverage(&self.client, &room).await?;
-            if cov.members > 0 && cov.devices == 0 {
+            if cov.members == 0 {
+                bail!("nobody but the bot is in {room_id} (or can read it); refusing to post a message nobody can decrypt");
+            }
+            if cov.devices == 0 {
                 bail!(
                     "no member of {} has a device that could receive the room key (members: {}); refusing to \
                      post a message nobody can decrypt",
@@ -572,7 +707,7 @@ async fn ensure_joined(client: &Client, target: &RoomTarget, force_sync: bool) -
             let r = room.unwrap();
             r.join().await.with_context(|| format!("accepting invite to {room_id}"))?;
             info!(%room_id, "accepted invite");
-            Ok(client.get_room(&room_id).unwrap_or(r))
+            sync_after_join(client, &room_id).await
         }
         Some(RoomState::Banned) => bail!("this account is banned from {room_id}"),
         Some(RoomState::Left) | Some(RoomState::Knocked) | None => {
@@ -593,7 +728,21 @@ async fn ensure_joined(client: &Client, target: &RoomTarget, force_sync: bool) -
                 )
             })?;
             info!(%room_id, "joined room");
-            Ok(joined)
+            drop(joined);
+            sync_after_join(client, &room_id).await
         }
+    }
+}
+
+/// A room returned by `join` is a stub until a sync delivers its state
+/// (history visibility, encryption). Fetch it before anyone reads it.
+async fn sync_after_join(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> anyhow::Result<Room> {
+    client
+        .sync_once(SyncSettings::default().timeout(Duration::from_secs(5)).filter(lean_filter()))
+        .await
+        .context("sync after join")?;
+    match client.get_room(room_id) {
+        Some(r) if r.state() == RoomState::Joined => Ok(r),
+        other => bail!("room {room_id} not joined after sync (state: {:?})", other.map(|r| r.state())),
     }
 }

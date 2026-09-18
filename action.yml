@@ -123,9 +123,9 @@ runs:
           echo "::endgroup::"
         else
           # The token goes to curl through a 0600 config file, never argv.
-          hdr="$RUNNER_TEMP/.curl-auth"
-          (umask 077; printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" > "$hdr")
+          hdr="$(mktemp "$RUNNER_TEMP/.curl-auth.XXXXXX")"
           trap 'rm -f "$hdr"' EXIT
+          printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" > "$hdr"
           case "$(uname -s)-$(uname -m)" in
             Linux-x86_64)   target=x86_64-unknown-linux-musl ;;
             Linux-aarch64)  target=aarch64-unknown-linux-musl ;;
