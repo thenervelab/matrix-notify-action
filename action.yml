@@ -1,0 +1,228 @@
+# Copyright 2026 The Nerve Lab
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Matrix Notify (end-to-end encrypted)
+description: >-
+  Post an end-to-end encrypted message to a Matrix room from a workflow. The
+  bot's device identity lives in an encrypted repository secret, so every run
+  is the same verified device.
+author: The Nerve Lab
+
+branding:
+  icon: message-square
+  color: green
+
+inputs:
+  room:
+    description: Room alias (#ci:example.org), room id (!abc:example.org) or matrix.to link.
+    required: true
+  state:
+    description: The MATRIX_STATE secret printed by `matrix-notify login`.
+    required: true
+  state-key:
+    description: The MATRIX_STATE_KEY secret printed by `matrix-notify login` (64 hex chars).
+    required: true
+  message:
+    description: Message text. Read from here even with `format`, where it becomes the extra paragraph.
+    required: false
+    default: ""
+  markdown:
+    description: Render `message` as Markdown (formatted_body).
+    required: false
+    default: "false"
+  format:
+    description: '`github-run` renders a status card from the run context; empty sends `message` as is.'
+    required: false
+    default: ""
+  status:
+    description: 'Job status for `format: github-run` (success, failure, cancelled). Defaults to job.status.'
+    required: false
+    default: ""
+  notice:
+    description: Send as m.notice (true, default) or m.text (false).
+    required: false
+    default: "true"
+  allow-unencrypted:
+    description: Send plaintext when the room is not encrypted. Default refuses.
+    required: false
+    default: "false"
+  timeout:
+    description: Network timeout in seconds.
+    required: false
+    default: "60"
+  version:
+    description: >-
+      Release tag of the matrix-notify binary to download (default: the ref this
+      action was used at). `source` builds from the checked-out action tree with cargo.
+    required: false
+    default: ""
+  gh-token:
+    description: >-
+      Token with `secrets: write` on this repository. When set and the identity
+      changed (server rotated the token), the state secret is updated in place.
+      The default GITHUB_TOKEN cannot write secrets.
+    required: false
+    default: ""
+  secret-name:
+    description: Name of the repository secret to update when `gh-token` is set.
+    required: false
+    default: MATRIX_STATE
+
+outputs:
+  event-id:
+    description: Event id of the sent message.
+    value: ${{ steps.send.outputs.event-id }}
+  room-id:
+    description: Resolved room id.
+    value: ${{ steps.send.outputs.room-id }}
+  encrypted:
+    description: '"true" when the event was sent encrypted.'
+    value: ${{ steps.send.outputs.encrypted }}
+  state-changed:
+    description: '"true" when the identity changed and MATRIX_STATE must be re-published.'
+    value: ${{ steps.export.outputs.changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install matrix-notify
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version != '' && inputs.version || github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository != '' && github.action_repository || 'thenervelab/matrix-notify-action' }}
+        ACTION_PATH: ${{ github.action_path }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        bin_dir="$RUNNER_TEMP/matrix-notify/bin"
+        mkdir -p "$bin_dir"
+
+        if [ "$VERSION" = "source" ]; then
+          echo "::group::cargo build --release (source)"
+          cargo build --release --manifest-path "$ACTION_PATH/Cargo.toml" --locked
+          cp "$ACTION_PATH/target/release/matrix-notify" "$bin_dir/"
+          echo "::endgroup::"
+        else
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)   target=x86_64-unknown-linux-musl ;;
+            Linux-aarch64)  target=aarch64-unknown-linux-musl ;;
+            Darwin-arm64)   target=aarch64-apple-darwin ;;
+            Darwin-x86_64)  target=x86_64-apple-darwin ;;
+            *) echo "::error::unsupported runner: $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          case "$VERSION" in
+            v[0-9]*.[0-9]*.[0-9]*) tag="$VERSION" ;;
+            v[0-9]*)
+              # Major tag (v1): pick the newest v1.x.y release.
+              tag="$(curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/$ACTION_REPO/releases?per_page=100" \
+                | python3 -c 'import json,sys; p=sys.argv[1]+"."; print(next(r["tag_name"] for r in json.load(sys.stdin) if r["tag_name"].startswith(p) and not r["draft"] and not r["prerelease"]))' "$VERSION")"
+              echo "resolved $VERSION -> $tag" ;;
+            *) echo "::error::version '$VERSION' is not a release tag; pin the action to a vX.Y.Z tag or set version: source"; exit 1 ;;
+          esac
+          base="https://github.com/$ACTION_REPO/releases/download/$tag"
+          asset="matrix-notify-$target.tar.gz"
+          echo "downloading $base/$asset"
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -o "$RUNNER_TEMP/$asset" "$base/$asset"
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -o "$RUNNER_TEMP/SHA256SUMS" "$base/SHA256SUMS"
+          expected="$(grep " $asset\$" "$RUNNER_TEMP/SHA256SUMS" | cut -d' ' -f1)"
+          [ -n "$expected" ] || { echo "::error::$asset missing from SHA256SUMS"; exit 1; }
+          actual="$(sha256sum "$RUNNER_TEMP/$asset" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$RUNNER_TEMP/$asset" | cut -d' ' -f1)"
+          [ "$expected" = "$actual" ] || { echo "::error::checksum mismatch for $asset"; exit 1; }
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$bin_dir" matrix-notify
+          rm -f "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/SHA256SUMS"
+        fi
+        chmod 0755 "$bin_dir/matrix-notify"
+        "$bin_dir/matrix-notify" --version
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "MATRIX_NOTIFY_STORE=$RUNNER_TEMP/matrix-notify/store" >> "$GITHUB_ENV"
+
+    - name: Restore device state
+      id: import
+      shell: bash
+      env:
+        MATRIX_STATE: ${{ inputs.state }}
+        MATRIX_STATE_KEY: ${{ inputs.state-key }}
+      run: |
+        set -euo pipefail
+        [ -n "$MATRIX_STATE" ] || { echo "::error::input 'state' is empty: run 'matrix-notify login' once and store MATRIX_STATE / MATRIX_STATE_KEY as secrets"; exit 1; }
+        [ -n "$MATRIX_STATE_KEY" ] || { echo "::error::input 'state-key' is empty"; exit 1; }
+        printf '%s' "$MATRIX_STATE" | matrix-notify state import --in -
+        echo "fingerprint=$(matrix-notify state fingerprint)" >> "$GITHUB_OUTPUT"
+
+    - name: Send
+      id: send
+      shell: bash
+      env:
+        MATRIX_ROOM: ${{ inputs.room }}
+        MESSAGE: ${{ inputs.message }}
+        FORMAT: ${{ inputs.format }}
+        MATRIX_NOTIFY_STATUS: ${{ inputs.status != '' && inputs.status || job.status }}
+        MARKDOWN: ${{ inputs.markdown }}
+        NOTICE: ${{ inputs.notice }}
+        ALLOW_UNENCRYPTED: ${{ inputs.allow-unencrypted }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+        args=(send --json --timeout "$TIMEOUT" --notice="$NOTICE")
+        [ -n "$FORMAT" ] && args+=(--format "$FORMAT")
+        [ "$MARKDOWN" = "true" ] && args+=(--markdown)
+        [ "$ALLOW_UNENCRYPTED" = "true" ] && args+=(--allow-unencrypted)
+        if [ -n "$MESSAGE" ]; then
+          out="$(printf '%s' "$MESSAGE" | matrix-notify "${args[@]}" --message -)"
+        else
+          [ -n "$FORMAT" ] || { echo "::error::either 'message' or 'format' is required"; exit 1; }
+          out="$(matrix-notify "${args[@]}")"
+        fi
+        echo "$out"
+        python3 - "$out" >> "$GITHUB_OUTPUT" <<'PY' || true
+        import json, sys
+        d = json.loads(sys.argv[1])
+        print(f"event-id={d['event_id']}")
+        print(f"room-id={d['room_id']}")
+        print(f"encrypted={'true' if d['encrypted'] else 'false'}")
+        PY
+
+    - name: Export state if the identity changed
+      id: export
+      if: always() && steps.import.outcome == 'success'
+      shell: bash
+      env:
+        BEFORE: ${{ steps.import.outputs.fingerprint }}
+        MATRIX_STATE_KEY: ${{ inputs.state-key }}
+        GH_TOKEN: ${{ inputs.gh-token }}
+        SECRET_NAME: ${{ inputs.secret-name }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        after="$(matrix-notify state fingerprint 2>/dev/null || true)"
+        if [ -z "$after" ] || [ "$after" = "$BEFORE" ]; then
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+        blob="$(matrix-notify state export --out -)"
+        echo "::add-mask::$blob"
+        if [ -n "$GH_TOKEN" ]; then
+          printf '%s' "$blob" | matrix-notify github-secret --name "$SECRET_NAME" --repo "$GITHUB_REPOSITORY" --value-file -
+          echo "::notice::the bot's session changed; repository secret $SECRET_NAME was updated"
+        else
+          echo "::warning::the bot's session changed (fingerprint $BEFORE -> $after). Re-run 'matrix-notify login' and update the $SECRET_NAME secret, or pass gh-token so the action can do it."
+        fi
+
+    - name: Remove device state from the runner
+      if: always()
+      shell: bash
+      run: rm -rf "$RUNNER_TEMP/matrix-notify/store"

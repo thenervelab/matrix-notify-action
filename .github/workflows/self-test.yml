@@ -1,0 +1,70 @@
+name: self-test
+
+# Sends a real encrypted message with the action from this checkout. Needs
+# the MATRIX_STATE / MATRIX_STATE_KEY secrets and the MATRIX_ROOM variable;
+# without them the job explains what is missing and exits green so forks
+# and pull requests from forks are not red for lack of credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: Extra text under the status card
+        required: false
+        default: manual self-test
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC: catches an expired token before a real failure does
+  push:
+    branches: [main]
+    paths: [action.yml, src/**, Cargo.*]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check credentials
+        id: creds
+        env:
+          HAS_STATE: ${{ secrets.MATRIX_STATE != '' && secrets.MATRIX_STATE_KEY != '' }}
+          ROOM: ${{ vars.MATRIX_ROOM }}
+        run: |
+          if [ "$HAS_STATE" != "true" ] || [ -z "$ROOM" ]; then
+            echo "::notice::self-test skipped: set repository secrets MATRIX_STATE and MATRIX_STATE_KEY (from 'matrix-notify login') and the MATRIX_ROOM variable"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.creds.outputs.ok == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.creds.outputs.ok == 'true'
+
+      - name: Send an encrypted status card
+        id: send
+        if: steps.creds.outputs.ok == 'true'
+        uses: ./
+        with:
+          version: source
+          room: ${{ vars.MATRIX_ROOM }}
+          state: ${{ secrets.MATRIX_STATE }}
+          state-key: ${{ secrets.MATRIX_STATE_KEY }}
+          format: github-run
+          status: success
+          message: ${{ inputs.message || 'scheduled self-test' }}
+          gh-token: ${{ secrets.MATRIX_SECRETS_TOKEN }}
+
+      - name: Assert the event was encrypted
+        if: steps.creds.outputs.ok == 'true'
+        env:
+          ENCRYPTED: ${{ steps.send.outputs.encrypted }}
+          EVENT: ${{ steps.send.outputs.event-id }}
+          CHANGED: ${{ steps.send.outputs.state-changed }}
+        run: |
+          echo "event: $EVENT  encrypted: $ENCRYPTED  state-changed: $CHANGED"
+          [ "$ENCRYPTED" = "true" ]
