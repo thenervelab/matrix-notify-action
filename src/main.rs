@@ -61,6 +61,15 @@ enum Cmd {
     },
     /// Create or update a GitHub Actions repository secret (needs a token with secrets: write)
     GithubSecret(GithubSecretArgs),
+    /// Finish or redo cross-signing for the device already in the store (then re-export the state)
+    CrossSign {
+        /// Read the account password from stdin, for servers that require interactive auth
+        #[arg(long)]
+        password_stdin: bool,
+        /// Replace an existing cross-signing identity with one owned by this device
+        #[arg(long)]
+        reset: bool,
+    },
 }
 
 #[derive(Args)]
@@ -88,14 +97,14 @@ struct LoginArgs {
     #[arg(long, default_value = "hippius.com")]
     homeserver: String,
     /// Localpart or full user id of the bot (ci or @ci:hippius.com)
-    #[arg(long, required_unless_present = "token")]
+    #[arg(long, required_unless_present = "token_stdin")]
     user: Option<String>,
     /// Read the password from stdin (first line)
-    #[arg(long, conflicts_with = "token")]
+    #[arg(long, conflicts_with = "token_stdin")]
     password_stdin: bool,
-    /// Access token for an existing device (e.g. issued by MAS); read from stdin with `-`
+    /// Read an access token for an existing device (e.g. issued by MAS) from stdin (first line)
     #[arg(long, conflicts_with = "password_stdin")]
-    token: Option<String>,
+    token_stdin: bool,
     /// Device display name. Default: "matrix-notify (<GITHUB_REPOSITORY>)" or "matrix-notify"
     #[arg(long)]
     device_name: Option<String>,
@@ -139,10 +148,11 @@ struct SendArgs {
     /// Send plaintext if the room is not encrypted (default: refuse)
     #[arg(long)]
     allow_unencrypted: bool,
-    /// Force a short sync before sending (otherwise only when the room is unknown)
+    /// Fail if any other member has no device that can receive the room key
+    /// (default: fail only when nobody at all could read the message)
     #[arg(long)]
-    sync: bool,
-    /// Overall network timeout in seconds
+    strict_recipients: bool,
+    /// Overall timeout in seconds for the whole send (sync, members, key queries, send)
     #[arg(long, default_value_t = 60)]
     timeout: u64,
     /// Print the event id as JSON on stdout
@@ -207,6 +217,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::State { cmd } => cmd_state(&dir, cmd),
         Cmd::Whoami { json } => cmd_whoami(&dir, json).await,
         Cmd::GithubSecret(a) => cmd_github_secret(a).await,
+        Cmd::CrossSign { password_stdin, reset } => cmd_cross_sign(&dir, password_stdin, reset).await,
     }
 }
 
@@ -231,14 +242,33 @@ fn default_device_name() -> String {
     }
 }
 
+fn print_cross_signing(report: &CrossSigningReport) {
+    match report {
+        CrossSigningReport::Bootstrapped => eprintln!("cross-signing: bootstrapped, device is self-signed"),
+        CrossSigningReport::Present => eprintln!("cross-signing: already present, device is self-signed"),
+        CrossSigningReport::NotSignedByExistingIdentity => eprintln!(
+            "cross-signing: WARNING an identity created by another session exists; this device is not signed by it.\n  \
+             Either verify this device from that session, or run `matrix-notify cross-sign --reset --password-stdin` \
+             on this store and re-export."
+        ),
+        CrossSigningReport::NeedsInteractiveAuth(why) => eprintln!(
+            "cross-signing: WARNING not bootstrapped: {why}\n  Finish it with `matrix-notify cross-sign \
+             --password-stdin` on this store and re-export."
+        ),
+    }
+}
+
 async fn cmd_login(dir: &std::path::Path, a: LoginArgs) -> anyhow::Result<()> {
-    let credentials = if let Some(token) = a.token {
-        let token = if token == "-" { read_stdin_line()?.to_string() } else { token };
-        Credentials::Token(token)
+    let credentials = if a.token_stdin {
+        let token = read_stdin_line()?;
+        if token.is_empty() {
+            bail!("empty token on stdin");
+        }
+        Credentials::Token(token.to_string())
     } else {
         let user = a.user.clone().ok_or_else(|| anyhow!("--user is required"))?;
         if !a.password_stdin {
-            bail!("provide the password with --password-stdin (or use --token)");
+            bail!("provide the password with --password-stdin (or use --token-stdin)");
         }
         if std::io::stdin().is_terminal() {
             eprintln!("password: (input is not hidden; pipe it in to avoid echo)");
@@ -270,17 +300,7 @@ async fn cmd_login(dir: &std::path::Path, a: LoginArgs) -> anyhow::Result<()> {
     .await?;
 
     eprintln!("logged in as {} device {} via {}", report.user_id, report.device_id, report.homeserver);
-    match &report.cross_signing {
-        CrossSigningReport::Bootstrapped => eprintln!("cross-signing: bootstrapped, device is self-signed"),
-        CrossSigningReport::Present => eprintln!("cross-signing: already present, device is self-signed"),
-        CrossSigningReport::NotSignedByExistingIdentity => eprintln!(
-            "cross-signing: WARNING an identity created by another session exists; this device is not signed by it.\n  \
-             Either verify this device from that session, or re-run with --reset-cross-signing."
-        ),
-        CrossSigningReport::NeedsInteractiveAuth(why) => {
-            eprintln!("cross-signing: WARNING not bootstrapped: {why}")
-        }
-    }
+    print_cross_signing(&report.cross_signing);
     for r in &report.joined {
         eprintln!("joined {r}");
     }
@@ -349,10 +369,19 @@ async fn cmd_send(dir: &std::path::Path, a: SendArgs) -> anyhow::Result<()> {
     };
 
     let timeout = Duration::from_secs(a.timeout);
-    let notifier = Notifier::open(dir, false, timeout).await?;
-    let opts = SendOptions { allow_unencrypted: a.allow_unencrypted, sync: a.sync, timeout };
-    let report = notifier.send(&target, message, &opts).await?;
-    let fingerprint = notifier.close().await?;
+    let opts = SendOptions {
+        allow_unencrypted: a.allow_unencrypted,
+        strict_recipients: a.strict_recipients,
+        timeout,
+    };
+    let (report, fingerprint) = tokio::time::timeout(timeout, async {
+        let notifier = Notifier::open(dir, false, timeout).await?;
+        let report = notifier.send(&target, message, &opts).await?;
+        let fingerprint = notifier.close().await?;
+        anyhow::Ok((report, fingerprint))
+    })
+    .await
+    .map_err(|_| anyhow!("send did not complete within {}s", a.timeout))??;
 
     if a.json {
         println!(
@@ -361,16 +390,19 @@ async fn cmd_send(dir: &std::path::Path, a: SendArgs) -> anyhow::Result<()> {
                 "room_id": report.room_id,
                 "event_id": report.event_id,
                 "encrypted": report.encrypted,
+                "members": report.members,
                 "recipients": report.recipients,
+                "members_without_devices": report.members_without_devices,
                 "identity_fingerprint": fingerprint,
             })
         );
     } else {
         eprintln!(
-            "sent {} to {} ({}, {} members)",
+            "sent {} to {} ({}, {} members, {} devices)",
             report.event_id,
             report.room_id,
             if report.encrypted { "encrypted" } else { "PLAINTEXT" },
+            report.members,
             report.recipients
         );
     }
@@ -407,9 +439,6 @@ fn cmd_state(dir: &std::path::Path, cmd: StateCmd) -> anyhow::Result<()> {
                 bail!("empty state input (is the MATRIX_STATE secret set?)");
             }
             let written = state::import(dir, &key, &bytes)?;
-            if !written.iter().any(|f| f == store::SESSION_FILE) {
-                bail!("archive did not contain {}", store::SESSION_FILE);
-            }
             eprintln!("imported {} file(s) into {}", written.len(), dir.display());
             Ok(())
         }
@@ -491,4 +520,30 @@ async fn cmd_github_secret(a: GithubSecretArgs) -> anyhow::Result<()> {
     client.put_secret(&a.name, &value).await?;
     eprintln!("secret {} updated on {}", a.name, a.repo);
     Ok(())
+}
+
+async fn cmd_cross_sign(dir: &std::path::Path, password_stdin: bool, reset: bool) -> anyhow::Result<()> {
+    let password = if password_stdin {
+        let p = read_stdin_line()?;
+        if p.is_empty() {
+            bail!("empty password on stdin");
+        }
+        Some(p.to_string())
+    } else {
+        None
+    };
+    let notifier = Notifier::open(dir, true, Duration::from_secs(60)).await?;
+    let report = notifier.cross_sign(reset, password).await?;
+    notifier.close().await?;
+    print_cross_signing(&report);
+    match report {
+        CrossSigningReport::Bootstrapped | CrossSigningReport::Present => {
+            eprintln!("re-export the state now: matrix-notify state export");
+            Ok(())
+        }
+        CrossSigningReport::NotSignedByExistingIdentity => {
+            bail!("device is not signed; use --reset to take over")
+        }
+        CrossSigningReport::NeedsInteractiveAuth(why) => bail!("not bootstrapped: {why}"),
+    }
 }

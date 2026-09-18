@@ -71,7 +71,11 @@ async fn send_from_snapshot(
         .send(
             room,
             Message::plain(text, true),
-            &SendOptions { allow_unencrypted: false, sync: false, timeout: Duration::from_secs(60) },
+            &SendOptions {
+                allow_unencrypted: false,
+                strict_recipients: false,
+                timeout: Duration::from_secs(60),
+            },
         )
         .await
         .unwrap();

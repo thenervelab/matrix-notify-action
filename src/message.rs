@@ -162,9 +162,8 @@ impl RunInfo {
         format!("{}/{}/commit/{}", self.server_url, self.repository, self.sha)
     }
 
-    fn short_sha(&self) -> &str {
-        let n = self.sha.len().min(7);
-        &self.sha[..n]
+    fn short_sha(&self) -> String {
+        self.sha.chars().take(7).collect()
     }
 
     /// Two lines of plain text plus an HTML card. `extra` is appended as a
@@ -192,7 +191,7 @@ impl RunInfo {
             where_ = escape_html(&where_),
             branch = escape_html(&self.ref_name),
             commit = escape_html(&self.commit_url()),
-            sha = escape_html(self.short_sha()),
+            sha = escape_html(&self.short_sha()),
             actor = escape_html(&self.actor),
             run_url = escape_html(&run_url),
         );

@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # State archive: tar + deflate + XChaCha20-Poly1305 with an HKDF-derived key.
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-chacha20poly1305 = "0.11"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 hkdf = "0.13"
 sha2 = "0.11"
 getrandom = "0.2"
@@ -43,6 +43,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 dirs = "6"
 url = "2"
+percent-encoding = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -57,6 +57,10 @@ inputs:
     description: Send plaintext when the room is not encrypted. Default refuses.
     required: false
     default: "false"
+  strict-recipients:
+    description: Fail when any member has no device. Default fails only when nobody could decrypt.
+    required: false
+    default: "false"
   timeout:
     description: Network timeout in seconds.
     required: false
@@ -69,9 +73,9 @@ inputs:
     default: ""
   gh-token:
     description: >-
-      Token with `secrets: write` on this repository. When set and the identity
-      changed (server rotated the token), the state secret is updated in place.
-      The default GITHUB_TOKEN cannot write secrets.
+      Token with `secrets: write` on this repository. When set and the device
+      identity changed during the run, the state secret is updated in place
+      instead of printing a warning. The default GITHUB_TOKEN cannot write secrets.
     required: false
     default: ""
   secret-name:
@@ -89,6 +93,9 @@ outputs:
   encrypted:
     description: '"true" when the event was sent encrypted.'
     value: ${{ steps.send.outputs.encrypted }}
+  recipients:
+    description: Number of devices the room key was shared with.
+    value: ${{ steps.send.outputs.recipients }}
   state-changed:
     description: '"true" when the identity changed and MATRIX_STATE must be re-published.'
     value: ${{ steps.export.outputs.changed }}
@@ -115,6 +122,10 @@ runs:
           cp "$ACTION_PATH/target/release/matrix-notify" "$bin_dir/"
           echo "::endgroup::"
         else
+          # The token goes to curl through a 0600 config file, never argv.
+          hdr="$RUNNER_TEMP/.curl-auth"
+          (umask 077; printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" > "$hdr")
+          trap 'rm -f "$hdr"' EXIT
           case "$(uname -s)-$(uname -m)" in
             Linux-x86_64)   target=x86_64-unknown-linux-musl ;;
             Linux-aarch64)  target=aarch64-unknown-linux-musl ;;
@@ -126,7 +137,7 @@ runs:
             v[0-9]*.[0-9]*.[0-9]*) tag="$VERSION" ;;
             v[0-9]*)
               # Major tag (v1): pick the newest v1.x.y release.
-              tag="$(curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+              tag="$(curl -fsSL --retry 3 -K "$hdr" \
                   "https://api.github.com/repos/$ACTION_REPO/releases?per_page=100" \
                 | python3 -c 'import json,sys; p=sys.argv[1]+"."; print(next(r["tag_name"] for r in json.load(sys.stdin) if r["tag_name"].startswith(p) and not r["draft"] and not r["prerelease"]))' "$VERSION")"
               echo "resolved $VERSION -> $tag" ;;
@@ -135,14 +146,14 @@ runs:
           base="https://github.com/$ACTION_REPO/releases/download/$tag"
           asset="matrix-notify-$target.tar.gz"
           echo "downloading $base/$asset"
-          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -o "$RUNNER_TEMP/$asset" "$base/$asset"
-          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -o "$RUNNER_TEMP/SHA256SUMS" "$base/SHA256SUMS"
+          curl -fsSL --retry 3 -K "$hdr" -o "$RUNNER_TEMP/$asset" "$base/$asset"
+          curl -fsSL --retry 3 -K "$hdr" -o "$RUNNER_TEMP/SHA256SUMS" "$base/SHA256SUMS"
           expected="$(grep " $asset\$" "$RUNNER_TEMP/SHA256SUMS" | cut -d' ' -f1)"
           [ -n "$expected" ] || { echo "::error::$asset missing from SHA256SUMS"; exit 1; }
           actual="$(sha256sum "$RUNNER_TEMP/$asset" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$RUNNER_TEMP/$asset" | cut -d' ' -f1)"
           [ "$expected" = "$actual" ] || { echo "::error::checksum mismatch for $asset"; exit 1; }
           tar -xzf "$RUNNER_TEMP/$asset" -C "$bin_dir" matrix-notify
-          rm -f "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/SHA256SUMS"
+          rm -f "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/SHA256SUMS" "$hdr"
         fi
         chmod 0755 "$bin_dir/matrix-notify"
         "$bin_dir/matrix-notify" --version
@@ -173,6 +184,7 @@ runs:
         MARKDOWN: ${{ inputs.markdown }}
         NOTICE: ${{ inputs.notice }}
         ALLOW_UNENCRYPTED: ${{ inputs.allow-unencrypted }}
+        STRICT: ${{ inputs.strict-recipients }}
         TIMEOUT: ${{ inputs.timeout }}
       run: |
         set -euo pipefail
@@ -180,6 +192,7 @@ runs:
         [ -n "$FORMAT" ] && args+=(--format "$FORMAT")
         [ "$MARKDOWN" = "true" ] && args+=(--markdown)
         [ "$ALLOW_UNENCRYPTED" = "true" ] && args+=(--allow-unencrypted)
+        [ "$STRICT" = "true" ] && args+=(--strict-recipients)
         if [ -n "$MESSAGE" ]; then
           out="$(printf '%s' "$MESSAGE" | matrix-notify "${args[@]}" --message -)"
         else
@@ -193,6 +206,7 @@ runs:
         print(f"event-id={d['event_id']}")
         print(f"room-id={d['room_id']}")
         print(f"encrypted={'true' if d['encrypted'] else 'false'}")
+        print(f"recipients={d['recipients']}")
         PY
 
     - name: Export state if the identity changed

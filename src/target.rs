@@ -67,7 +67,7 @@ fn strip_permalink(raw: &str) -> (String, Option<&str>) {
         Some((t, q)) => (t, Some(q)),
         None => (rest, None),
     };
-    let target = target.replace("%23", "#").replace("%21", "!").replace("%3A", ":");
+    let target = percent_encoding::percent_decode_str(target).decode_utf8_lossy().into_owned();
     (target, query)
 }
 
@@ -76,7 +76,7 @@ fn query_via(query: Option<&str>) -> Vec<OwnedServerName> {
         .unwrap_or("")
         .split('&')
         .filter_map(|kv| kv.strip_prefix("via="))
-        .filter_map(|v| v.parse().ok())
+        .filter_map(|v| percent_encoding::percent_decode_str(v).decode_utf8_lossy().parse().ok())
         .collect()
 }
 
@@ -102,6 +102,8 @@ mod tests {
     #[test]
     fn permalinks() {
         let t = RoomTarget::parse("https://matrix.to/#/%23ci%3Ahippius.com").unwrap();
+        assert_eq!(t.describe(), "#ci:hippius.com");
+        let t = RoomTarget::parse("https://matrix.to/#/%23ci%3ahippius.com?via=hippius%2Ecom").unwrap();
         assert_eq!(t.describe(), "#ci:hippius.com");
         let t =
             RoomTarget::parse("https://matrix.to/#/!abc:hippius.com?via=hippius.com&via=matrix.org").unwrap();

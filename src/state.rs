@@ -81,6 +81,10 @@ pub enum StateError {
     NotAFile(PathBuf),
     #[error("archive is larger than the {MAX_PLAINTEXT}-byte limit")]
     TooLarge,
+    #[error("store is missing {0}; cannot export a partial identity")]
+    MissingFile(String),
+    #[error("archive is missing {0}; refusing to restore a partial identity")]
+    Incomplete(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -177,18 +181,21 @@ pub fn open(key: &StateKey, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, StateErro
 }
 
 /// Build the deterministic gzip'd tar of `files` (relative names) found in
-/// `dir`. Missing files are skipped: a store that never had an event cache
-/// still exports.
+/// `dir`. Every listed file must exist: a snapshot without the crypto
+/// store would restore a device that lost its keys.
 pub fn pack(dir: &Path, files: &[&str]) -> Result<Vec<u8>, StateError> {
     let gz = GzEncoder::new(Vec::new(), Compression::best());
     let mut tar = tar::Builder::new(gz);
     tar.mode(tar::HeaderMode::Deterministic);
     for name in files {
         let path = dir.join(name);
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
+        let mut f = std::fs::File::open(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => StateError::MissingFile((*name).to_owned()),
+            _ => StateError::Io(e),
+        })?;
         let meta = f.metadata()?;
         if !meta.is_file() {
-            continue;
+            return Err(StateError::NotAFile(path));
         }
         let mut header = tar::Header::new_gnu();
         header.set_size(meta.len());
@@ -204,10 +211,27 @@ pub fn pack(dir: &Path, files: &[&str]) -> Result<Vec<u8>, StateError> {
 }
 
 /// Inverse of [`pack`]: write the archive's regular files into `dir`
-/// (created with mode 0700 if missing). Rejects anything that is not a
-/// plain relative file name so a hostile archive cannot write outside `dir`.
+/// (created with mode 0700 if missing). The whole archive is extracted into
+/// a staging directory first and only replaces the existing files once every
+/// entry has been validated, so a bad archive or a failed write never leaves
+/// a mix of old and new files. Rejects anything that is not a plain relative
+/// file name so a hostile archive cannot write outside `dir`.
 pub fn unpack(dir: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
     crate::store::ensure_private_dir(dir)?;
+    let staging = dir.join(format!(".import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    crate::store::ensure_private_dir(&staging)?;
+    let result = unpack_into(&staging, tgz).and_then(|names| {
+        for name in &names {
+            std::fs::rename(staging.join(name), dir.join(name))?;
+        }
+        Ok(names)
+    });
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn unpack_into(staging: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
     let gz = GzDecoder::new(tgz);
     let mut archive = tar::Archive::new(gz.take(MAX_PLAINTEXT));
     let mut written = Vec::new();
@@ -222,15 +246,14 @@ pub fn unpack(dir: &Path, tgz: &[u8]) -> Result<Vec<String>, StateError> {
             (Some(Component::Normal(n)), None) => n.to_owned(),
             _ => return Err(StateError::UnsafePath(path)),
         };
-        let dest = dir.join(&name);
-        let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
-        {
-            let mut f = crate::store::create_private_file(&tmp)?;
-            std::io::copy(&mut entry, &mut f)?;
-            f.sync_all()?;
+        let name = name.to_string_lossy().into_owned();
+        if name.starts_with('.') || written.contains(&name) {
+            return Err(StateError::UnsafePath(path));
         }
-        std::fs::rename(&tmp, &dest)?;
-        written.push(name.to_string_lossy().into_owned());
+        let mut f = crate::store::create_private_file(&staging.join(&name))?;
+        std::io::copy(&mut entry, &mut f)?;
+        f.sync_all()?;
+        written.push(name);
     }
     if archive.into_inner().limit() == 0 {
         return Err(StateError::TooLarge);
@@ -255,7 +278,13 @@ pub fn import(dir: &Path, key: &StateKey, input: &[u8]) -> Result<Vec<String>, S
         base64::engine::general_purpose::STANDARD.decode(compact)?
     };
     let tgz = open(key, &blob)?;
-    unpack(dir, &tgz)
+    let names = unpack(dir, &tgz)?;
+    for required in crate::store::EXPORTED_FILES {
+        if !names.iter().any(|n| n == required) {
+            return Err(StateError::Incomplete((*required).to_owned()));
+        }
+    }
+    Ok(names)
 }
 
 /// Convenience for the CLI: write `s` to `out` (a path or `-` for stdout)
@@ -388,5 +417,45 @@ mod tests {
         tar.append_link(&mut h, "link", "/etc/passwd").unwrap();
         let tgz = tar.into_inner().unwrap().finish().unwrap();
         assert!(matches!(unpack(dst.path(), &tgz).unwrap_err(), StateError::NotAFile(_)));
+    }
+
+    #[test]
+    fn failed_restore_leaves_existing_files_untouched() {
+        // Archive: a valid session.json followed by an entry that escapes.
+        let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for (name, data) in [("session.json", &b"new"[..]), ("nested/escape", &b"evil"[..])] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o600);
+            h.set_cksum();
+            tar.append_data(&mut h, name, data).unwrap();
+        }
+        let tgz = tar.into_inner().unwrap().finish().unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("session.json"), b"old").unwrap();
+        assert!(matches!(unpack(dst.path(), &tgz).unwrap_err(), StateError::UnsafePath(_)));
+        assert_eq!(std::fs::read(dst.path().join("session.json")).unwrap(), b"old");
+        let leftovers: Vec<_> =
+            std::fs::read_dir(dst.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("session.json")], "no staging dir left behind");
+    }
+
+    #[test]
+    fn export_and_import_require_the_full_identity() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("session.json"), b"{}").unwrap();
+        let key = StateKey::generate().unwrap();
+        assert!(
+            matches!(export(src.path(), &key).unwrap_err(), StateError::MissingFile(f) if f == crate::store::STATE_DB)
+        );
+
+        // A sealed archive holding only session.json is authentic but partial.
+        let tgz = pack(src.path(), &["session.json"]).unwrap();
+        let blob = seal(&key, &tgz).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        assert!(
+            matches!(import(dst.path(), &key, &blob).unwrap_err(), StateError::Incomplete(f) if f == crate::store::STATE_DB)
+        );
     }
 }

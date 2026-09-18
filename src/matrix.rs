@@ -39,7 +39,7 @@ use matrix_sdk::ruma::api::client::filter::{FilterDefinition, LazyLoadOptions, R
 use matrix_sdk::ruma::api::client::sync::sync_events::v3::Filter;
 use matrix_sdk::ruma::api::client::uiaa::{AuthData, MatrixUserIdentifier, Password, UserIdentifier};
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomOrAliasId, UserId};
-use matrix_sdk::{Client, Room, RoomState, SessionMeta, SessionTokens};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState, SessionMeta, SessionTokens};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -94,8 +94,9 @@ pub enum CrossSigningReport {
 
 pub struct SendOptions {
     pub allow_unencrypted: bool,
-    /// Run a short sync before sending even if the room is already known.
-    pub sync: bool,
+    /// Fail when any other member of the room has no device that can receive
+    /// the room key. Default: fail only when nobody at all can read it.
+    pub strict_recipients: bool,
     pub timeout: Duration,
 }
 
@@ -104,7 +105,48 @@ pub struct SendReport {
     pub room_id: OwnedRoomId,
     pub event_id: String,
     pub encrypted: bool,
+    /// Joined or invited members other than the bot.
+    pub members: usize,
+    /// Devices of those members known after a fresh key query, i.e. the set
+    /// the room key was shared with.
     pub recipients: usize,
+    /// Members whose key query returned no device (federation failure,
+    /// deactivated account, or no E2E client).
+    pub members_without_devices: Vec<String>,
+}
+
+/// Result of a fresh key query over the room's active members.
+struct Coverage {
+    members: usize,
+    devices: usize,
+    without_devices: Vec<String>,
+}
+
+/// Query the server for every other active member's devices and count what
+/// we would encrypt to. The SDK does the same query inside `room.send` but
+/// treats "no devices" as "nothing to share with" and reports success; a
+/// notification nobody can decrypt is a failure for us.
+async fn recipient_coverage(client: &Client, room: &Room) -> anyhow::Result<Coverage> {
+    let own = client.user_id().ok_or_else(|| anyhow!("client has no user id"))?;
+    let members = room.members(RoomMemberships::ACTIVE).await.context("listing room members")?;
+    let enc = client.encryption();
+    let mut cov = Coverage { members: 0, devices: 0, without_devices: Vec::new() };
+    for m in members.iter().filter(|m| m.user_id() != own) {
+        cov.members += 1;
+        // One /keys/query per member; marks the user as tracked so the
+        // SDK's own pre-send query has nothing left to fetch.
+        enc.request_user_identity(m.user_id())
+            .await
+            .with_context(|| format!("querying keys of {}", m.user_id()))?;
+        let devices =
+            enc.get_user_devices(m.user_id()).await.with_context(|| format!("devices of {}", m.user_id()))?;
+        let n = devices.devices().filter(|d| !d.is_deleted() && !d.is_blacklisted()).count();
+        if n == 0 {
+            cov.without_devices.push(m.user_id().to_string());
+        }
+        cov.devices += n;
+    }
+    Ok(cov)
 }
 
 #[derive(Debug)]
@@ -275,7 +317,13 @@ async fn setup_cross_signing(
     password: Option<(String, String)>,
 ) -> anyhow::Result<CrossSigningReport> {
     let enc = client.encryption();
-    let existing = enc.get_user_identity(user_id).await.context("looking up own identity")?;
+    // Ask the server, not the local cache: an empty cache after a failed key
+    // query must not be read as "no identity exists" or we would replace
+    // the account's cross-signing keys without --reset-cross-signing.
+    let existing = enc
+        .request_user_identity(user_id)
+        .await
+        .context("querying own cross-signing identity on the server (not bootstrapping blind)")?;
     let status = enc.cross_signing_status().await;
     let have_private = status.as_ref().is_some_and(|s| s.has_master && s.has_self_signing);
 
@@ -350,13 +398,17 @@ impl Notifier {
         message: Message,
         opts: &SendOptions,
     ) -> anyhow::Result<SendReport> {
-        let room = ensure_joined(&self.client, target, opts.sync).await?;
+        // Always run one incremental sync from the snapshot's token: the
+        // state we restored is as old as the snapshot (encryption state,
+        // history visibility, membership), and it is never written back.
+        let room = ensure_joined(&self.client, target, true).await?;
         let room_id = room.room_id().to_owned();
 
-        // Fresh membership: a member who joined since the snapshot must get
-        // the room key too.
+        // sync_members() is a no-op when the snapshot already carried a
+        // member list; force the /members request so a member who joined
+        // since the snapshot gets the room key and one who left does not.
+        room.mark_members_missing();
         room.sync_members().await.context("fetching room members")?;
-        let recipients = room.joined_members_count() as usize;
 
         let enc_state = room.latest_encryption_state().await.context("reading room encryption state")?;
         let encrypted = enc_state.is_encrypted();
@@ -369,7 +421,33 @@ impl Notifier {
             );
         }
 
+        let mut cov = Coverage { members: 0, devices: 0, without_devices: Vec::new() };
         if encrypted {
+            cov = recipient_coverage(&self.client, &room).await?;
+            if cov.members > 0 && cov.devices == 0 {
+                bail!(
+                    "no member of {} has a device that could receive the room key (members: {}); refusing to \
+                     post a message nobody can decrypt",
+                    room_id,
+                    cov.without_devices.join(", ")
+                );
+            }
+            if !cov.without_devices.is_empty() {
+                if opts.strict_recipients {
+                    bail!(
+                        "--strict-recipients: {} member(s) of {} have no device: {}",
+                        cov.without_devices.len(),
+                        room_id,
+                        cov.without_devices.join(", ")
+                    );
+                }
+                warn!(
+                    "{} member(s) of {} have no device and will not be able to read this: {}",
+                    cov.without_devices.len(),
+                    room_id,
+                    cov.without_devices.join(", ")
+                );
+            }
             // Never reuse a Megolm session from the snapshot: see store::hygiene.
             room.discard_room_key().await.context("rotating room key")?;
         }
@@ -382,7 +460,14 @@ impl Notifier {
         let event_id = result.response.event_id.to_string();
         info!(%room_id, %event_id, encrypted, "message sent");
 
-        Ok(SendReport { room_id, event_id, encrypted, recipients })
+        Ok(SendReport {
+            room_id,
+            event_id,
+            encrypted,
+            members: cov.members,
+            recipients: cov.devices,
+            members_without_devices: cov.without_devices,
+        })
     }
 
     pub async fn whoami(&self) -> anyhow::Result<WhoAmI> {
@@ -411,6 +496,29 @@ impl Notifier {
             joined_rooms: self.client.joined_rooms().iter().map(|r| r.room_id().to_string()).collect(),
             server_ok,
         })
+    }
+
+    /// Finish (or redo) cross-signing for the device in this store, e.g.
+    /// after `login` ended with a UIA warning. `password` is used only if
+    /// the server asks for interactive auth.
+    pub async fn cross_sign(
+        &self,
+        reset: bool,
+        password: Option<String>,
+    ) -> anyhow::Result<CrossSigningReport> {
+        let user_id: OwnedUserId = self.session.user_id.parse().context("session.json: bad user_id")?;
+        self.client
+            .sync_once(SyncSettings::default().timeout(Duration::ZERO).filter(lean_filter()))
+            .await
+            .context("sync before cross-signing")?;
+        let pw = password.map(|p| (user_id.to_string(), p));
+        let report = setup_cross_signing(&self.client, &user_id, reset, pw).await?;
+        self.client.encryption().wait_for_e2ee_initialization_tasks().await;
+        self.client
+            .sync_once(SyncSettings::default().timeout(Duration::ZERO).filter(lean_filter()))
+            .await
+            .ok();
+        Ok(report)
     }
 
     /// Invalidate the token and delete the device on the server. The store
