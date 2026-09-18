@@ -456,9 +456,17 @@ async fn setup_cross_signing(
         // login that stopped at UIA): re-upload and sign.
     }
 
-    if let Some(why) =
-        upload_identity(client, reset && server.master_key.is_some(), password.as_ref()).await?
-    {
+    // Bound the upload: CrossSigningResetHandle::auth polls for up to two
+    // minutes when a UIA stage other than password is outstanding.
+    let uploaded =
+        tokio::time::timeout(Duration::from_secs(90), upload_identity(client, reset, password.as_ref()))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "cross-signing upload did not complete within 90 s (server wants more than a password?)"
+                )
+            })??;
+    if let Some(why) = uploaded {
         return Ok(CrossSigningReport::NeedsInteractiveAuth(why));
     }
 
@@ -735,14 +743,27 @@ async fn ensure_joined(client: &Client, target: &RoomTarget, force_sync: bool) -
 }
 
 /// A room returned by `join` is a stub until a sync delivers its state
-/// (history visibility, encryption). Fetch it before anyone reads it.
+/// (history visibility, encryption). Sync until the join shows up: a busy
+/// account gets an immediate /sync answer that may predate the join on a
+/// homeserver with replication lag.
 async fn sync_after_join(client: &Client, room_id: &matrix_sdk::ruma::RoomId) -> anyhow::Result<Room> {
-    client
-        .sync_once(SyncSettings::default().timeout(Duration::from_secs(5)).filter(lean_filter()))
-        .await
-        .context("sync after join")?;
-    match client.get_room(room_id) {
-        Some(r) if r.state() == RoomState::Joined => Ok(r),
-        other => bail!("room {room_id} not joined after sync (state: {:?})", other.map(|r| r.state())),
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        client
+            .sync_once(SyncSettings::default().timeout(Duration::from_secs(5)).filter(lean_filter()))
+            .await
+            .context("sync after join")?;
+        let room = client.get_room(room_id);
+        if let Some(r) = &room {
+            if r.state() == RoomState::Joined && r.history_visibility().is_some() {
+                return Ok(r.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "room {room_id} not joined with state after 30 s of syncing (state: {:?})",
+                room.map(|r| r.state())
+            );
+        }
     }
 }
