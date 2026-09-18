@@ -1,0 +1,62 @@
+[package]
+name = "matrix-notify"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Post end-to-end encrypted messages to a Matrix room from CI"
+repository = "https://github.com/thenervelab/matrix-notify-action"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "matrix-notify"
+path = "src/main.rs"
+
+[dependencies]
+# Matrix client. Pinned to an exact minor: `state hygiene` touches the SQLite
+# crypto-store schema directly (see src/store.rs) and is checked against it.
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["e2e-encryption", "sqlite", "bundled-sqlite", "rustls-aws-lc-rs"] }
+# Same rusqlite the SDK links, so the bundled SQLite is built once.
+rusqlite = { version = "0.40", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "fs", "time", "signal"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# State archive: tar + deflate + XChaCha20-Poly1305 with an HKDF-derived key.
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+getrandom = "0.2"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+# GitHub secrets API: libsodium sealed box (crypto_box_seal) over the repo public key.
+crypto_box = { version = "0.9", features = ["seal"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+dirs = "6"
+url = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[features]
+default = []
+# Integration test against a live homeserver; see scripts/e2e.sh.
+e2e = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 2
